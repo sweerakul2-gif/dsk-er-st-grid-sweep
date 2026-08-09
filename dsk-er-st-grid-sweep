@@ -1,0 +1,387 @@
+//@version=6
+indicator(
+    title       = "DSK ER-ST Grid Sweep v1.3",
+    overlay     = true,
+    max_bars_back = 500,
+    max_lines_count = 500,
+    max_labels_count = 500
+)
+
+// ═══════════════════════════════════════════════════════════════
+//  1. INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+// --- Grid Parameters (Multiplier levels) ---
+i_mult_start      = input.float(1.75, "Multiplier Start", minval=0.5, maxval=5.0, step=0.25, group="Grid")
+i_mult_step       = input.float(0.25, "Multiplier Step", minval=0.1, maxval=1.0, step=0.05, group="Grid")
+i_mult_count      = input.int(11, "Number of Levels", minval=3, maxval=20, group="Grid")
+
+// --- ER-Gated Parameters ---
+i_er_min_mult     = input.float(1.75, "ER Min Multiplier", minval=0.5, maxval=3.0, step=0.25, group="ER-Gated", tooltip="Multiplier when ER=1 (strong trend)")
+i_er_len          = input.int(14, "ER Length", minval=5, maxval=50, group="ER-Gated")
+i_er_smooth       = input.int(3, "ER Smoothing", minval=1, maxval=10, group="ER-Gated")
+i_er_atr_len      = input.int(14, "ER ATR Length", minval=5, maxval=30, group="ER-Gated")
+i_std_atr_len     = input.int(10, "Standard ATR Length", minval=5, maxval=30, group="Standard ST")
+
+// --- HTF Filter Parameters ---
+i_htf_type        = input.string("SMA", "HTF MA Type", options=["SMA", "EMA", "WMA", "ALMA"], group="HTF Filter")
+i_htf_len         = input.int(200, "HTF MA Length", minval=10, maxval=500, step=5, group="HTF Filter")
+i_htf_alma_offset = input.float(0.85, "ALMA Offset", minval=0.0, maxval=1.0, step=0.05, group="HTF Filter", tooltip="Only for ALMA")
+i_htf_alma_sigma  = input.int(6, "ALMA Sigma", minval=1, maxval=20, group="HTF Filter", tooltip="Only for ALMA")
+
+// --- Plateau Detection ---
+i_plateau_threshold = input.float(5.0, "Plateau Threshold (%)", minval=0.5, maxval=20.0, step=0.5, group="Plateau", tooltip="Max % difference between adjacent levels to be considered a plateau")
+i_plateau_min_len   = input.int(3, "Plateau Min Length", minval=2, maxval=8, group="Plateau", tooltip="Minimum number of consecutive levels for a plateau")
+
+// --- Display ---
+i_show_table = input.bool(true, "Show Table", group="Display")
+
+// ═══════════════════════════════════════════════════════════════
+//  2. FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+f_kaufman_er(src, len) =>
+    change = math.abs(src - src[len])
+    volatility = math.sum(math.abs(src - nz(src[1])), len)
+    er = volatility != 0 ? change / volatility : 0.0
+    er
+
+f_tema(src, len) =>
+    e1 = ta.ema(src, len)
+    e2 = ta.ema(e1, len)
+    e3 = ta.ema(e2, len)
+    3.0 * e1 - 3.0 * e2 + e3
+
+f_htf_ma(src, type, len, alma_offset, alma_sigma) =>
+    _ma = type == "SMA" ? ta.sma(src, len) :
+          type == "EMA" ? ta.ema(src, len) :
+          type == "WMA" ? ta.wma(src, len) :
+          type == "ALMA" ? ta.alma(src, len, alma_offset, alma_sigma) : ta.sma(src, len)
+    _ma
+
+f_format_exp(exp, pf, show_pf) =>
+    _exp_str = str.tostring(exp, "#.##")
+    _pf_str  = str.tostring(pf, "#.##")
+    _out = _exp_str
+    if show_pf
+        _out := _out + " (" + _pf_str + ")"
+    _out
+
+// ═══════════════════════════════════════════════════════════════
+//  3. PRE-CALCULATIONS (ค่าที่ใช้ร่วมทุก cell)
+// ═══════════════════════════════════════════════════════════════
+
+// --- Multiplier array ---
+var float[] mult_arr = array.new_float(0)
+for m = 0 to i_mult_count - 1
+    val = i_mult_start + m * i_mult_step
+    array.push(mult_arr, val)
+
+total_rows = i_mult_count
+total_cols = 4
+total_cells = total_rows * total_cols
+
+// --- Standard ST ---
+std_atr = ta.atr(i_std_atr_len)
+
+// --- ER-Gated ---
+er_raw = f_kaufman_er(close, i_er_len)
+er_smooth = i_er_smooth > 1 ? f_tema(er_raw, i_er_smooth) : er_raw
+er = math.min(math.max(er_smooth, 0.0), 1.0)
+er_atr = ta.atr(i_er_atr_len)
+
+// --- HTF MA ---
+htf_ma = f_htf_ma(close, i_htf_type, i_htf_len, i_htf_alma_offset, i_htf_alma_sigma)
+
+// ═══════════════════════════════════════════════════════════════
+//  4. STATE ARRAYS (44 cells)
+// ═══════════════════════════════════════════════════════════════
+
+var float[] up_arr   = array.new_float(total_cells, na)
+var float[] down_arr = array.new_float(total_cells, na)
+var int[]   dir_arr  = array.new_int(total_cells, 1)
+var int[]   pos_arr  = array.new_int(total_cells, 0)
+var float[] entry_price_arr = array.new_float(total_cells, 0.0)
+
+var float[] cum_pnl_arr    = array.new_float(total_cells, 0.0)
+var int[]   trade_count_arr = array.new_int(total_cells, 0)
+var int[]   win_count_arr   = array.new_int(total_cells, 0)
+var int[]   loss_count_arr  = array.new_int(total_cells, 0)
+var float[] gross_win_arr   = array.new_float(total_cells, 0.0)
+var float[] gross_loss_arr  = array.new_float(total_cells, 0.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  5. MAIN LOOP (ทุก bar)
+// ═══════════════════════════════════════════════════════════════
+
+for cell = 0 to total_cells - 1
+    row_idx = cell / total_cols
+    col_idx = cell % total_cols
+    mult = array.get(mult_arr, row_idx)
+
+    is_std = col_idx < 2
+    is_htf = (col_idx % 2) == 1
+
+    var float src = close
+    var float factor = 1.0
+    var float atr = 0.0
+
+    if is_std
+        src := hl2
+        factor := mult
+        atr := std_atr
+    else
+        src := close
+        dynamic_mult = i_er_min_mult + (1.0 - er) * (mult - i_er_min_mult)
+        factor := dynamic_mult
+        atr := er_atr
+
+    prev_up = array.get(up_arr, cell)
+    prev_down = array.get(down_arr, cell)
+    prev_dir = array.get(dir_arr, cell)
+    position = array.get(pos_arr, cell)
+    entry_price = array.get(entry_price_arr, cell)
+
+    upper_band = src + factor * atr
+    lower_band = src - factor * atr
+
+    new_lower = lower_band > nz(prev_down, lower_band) or (close[1] < nz(prev_down, lower_band)) ? lower_band : nz(prev_down, lower_band)
+    new_upper = upper_band < nz(prev_up, upper_band) or (close[1] > nz(prev_up, upper_band)) ? upper_band : nz(prev_up, upper_band)
+    new_dir = close > nz(prev_up, upper_band) ? 1 : close < nz(prev_down, lower_band) ? -1 : nz(prev_dir, 1)
+
+    htf_ok = (not is_htf) or (close > htf_ma)
+
+    cum_pnl = array.get(cum_pnl_arr, cell)
+    trade_count = array.get(trade_count_arr, cell)
+    win_count = array.get(win_count_arr, cell)
+    loss_count = array.get(loss_count_arr, cell)
+    gross_win = array.get(gross_win_arr, cell)
+    gross_loss = array.get(gross_loss_arr, cell)
+
+    if position == 1 and new_dir == -1 and prev_dir == 1
+        pnl = (close - entry_price) / entry_price * 100
+        cum_pnl += pnl
+        trade_count += 1
+        if pnl > 0
+            win_count += 1
+            gross_win += pnl
+        else if pnl < 0
+            loss_count += 1
+            gross_loss += math.abs(pnl)
+        position := 0
+
+    if position == 0 and new_dir == 1 and prev_dir == -1 and htf_ok
+        entry_price := close
+        position := 1
+
+    array.set(up_arr, cell, new_upper)
+    array.set(down_arr, cell, new_lower)
+    array.set(dir_arr, cell, new_dir)
+    array.set(pos_arr, cell, position)
+    array.set(entry_price_arr, cell, entry_price)
+    array.set(cum_pnl_arr, cell, cum_pnl)
+    array.set(trade_count_arr, cell, trade_count)
+    array.set(win_count_arr, cell, win_count)
+    array.set(loss_count_arr, cell, loss_count)
+    array.set(gross_win_arr, cell, gross_win)
+    array.set(gross_loss_arr, cell, gross_loss)
+
+// ═══════════════════════════════════════════════════════════════
+//  6. CALCULATE METRICS & BUILD TABLE (on last bar)
+// ═══════════════════════════════════════════════════════════════
+
+if barstate.islast and i_show_table
+    var float[] exp_arr = array.new_float(total_cells, na)
+    var float[] pf_arr = array.new_float(total_cells, na)
+
+    for cell = 0 to total_cells - 1
+        trade_count = array.get(trade_count_arr, cell)
+        if trade_count > 0
+            win_count = array.get(win_count_arr, cell)
+            loss_count = array.get(loss_count_arr, cell)
+            gross_win = array.get(gross_win_arr, cell)
+            gross_loss = array.get(gross_loss_arr, cell)
+
+            win_rate = win_count / trade_count
+            avg_win = win_count > 0 ? gross_win / win_count : 0.0
+            avg_loss = loss_count > 0 ? gross_loss / loss_count : 0.0
+            expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss
+            pf = gross_loss > 0 ? gross_win / gross_loss : 999.0
+
+            array.set(exp_arr, cell, expectancy)
+            array.set(pf_arr, cell, pf)
+        else
+            array.set(exp_arr, cell, na)
+            array.set(pf_arr, cell, na)
+
+    var float max_exp = na
+    var int peak_cell = -1
+    for cell = 0 to total_cells - 1
+        val = array.get(exp_arr, cell)
+        if not na(val) and (na(max_exp) or val > max_exp)
+            max_exp := val
+            peak_cell := cell
+
+    // --- Find Plateau ---
+    var int[] plat_col = array.new_int(0)
+    var int[] plat_start = array.new_int(0)
+    var int[] plat_end = array.new_int(0)
+    var float[] plat_max = array.new_float(0)
+
+    threshold_pct = i_plateau_threshold / 100.0
+
+    for col = 0 to 3
+        row = 0
+        while row < total_rows
+            start_row = row
+            end_row = row
+            while end_row + 1 < total_rows
+                var float min_val = 1e9
+                var float max_val = -1e9
+                var bool valid = true
+                for r = start_row to end_row + 1
+                    idx = r * total_cols + col
+                    val = array.get(exp_arr, idx)
+                    if na(val)
+                        valid := false
+                        break
+                    if val < min_val
+                        min_val := val
+                    if val > max_val
+                        max_val := val
+                if not valid
+                    break
+                if (max_val - min_val) / max_val <= threshold_pct
+                    end_row += 1
+                else
+                    break
+
+            len = end_row - start_row + 1
+            if len >= i_plateau_min_len
+                var float plat_max_val = -1e9
+                for r = start_row to end_row
+                    idx = r * total_cols + col
+                    val = array.get(exp_arr, idx)
+                    if not na(val) and val > plat_max_val
+                        plat_max_val := val
+                array.push(plat_col, col)
+                array.push(plat_start, start_row)
+                array.push(plat_end, end_row)
+                array.push(plat_max, plat_max_val)
+                row = end_row + 1
+            else
+                row += 1
+
+    var int best_plat_idx = -1
+    var float best_plat_max = na
+    for i = 0 to array.size(plat_max) - 1
+        val = array.get(plat_max, i)
+        if not na(val) and (na(best_plat_max) or val > best_plat_max)
+            best_plat_max := val
+            best_plat_idx := i
+
+    // --- Highlight ---
+    var color[] bgcolor_arr = array.new_color(total_cells, na)
+    var bool[] bold_arr = array.new_bool(total_cells, false)
+
+    if peak_cell != -1
+        array.set(bgcolor_arr, peak_cell, color.new(color.orange, 70))
+
+    if best_plat_idx != -1
+        best_col = array.get(plat_col, best_plat_idx)
+        best_start = array.get(plat_start, best_plat_idx)
+        best_end = array.get(plat_end, best_plat_idx)
+        for r = best_start to best_end
+            idx = r * total_cols + best_col
+            if na(array.get(bgcolor_arr, idx))
+                array.set(bgcolor_arr, idx, color.new(color.green, 80))
+
+        mid_row = math.floor((best_start + best_end) / 2)
+        mid_idx = mid_row * total_cols + best_col
+        array.set(bold_arr, mid_idx, true)
+
+    // --- Create Table ---
+    var table tbl = na
+    if na(tbl)
+        tbl := table.new(
+            position.bottom_right,
+            columns = 5,
+            rows = total_rows + 2,
+            bgcolor = color.white,
+            border_color = color.gray,
+            border_width = 1,
+            frame_width = 1
+        )
+
+    // --- Header ---
+    header_bg = color.new(color.gray, 30)
+    table.cell(tbl, 0, 0, "Multiplier", text_color=color.black, bgcolor=header_bg, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tbl, 1, 0, "STD_OFF", text_color=color.black, bgcolor=header_bg, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tbl, 2, 0, "STD_HTF", text_color=color.black, bgcolor=header_bg, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tbl, 3, 0, "ER_OFF", text_color=color.black, bgcolor=header_bg, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+    table.cell(tbl, 4, 0, "ER_HTF", text_color=color.black, bgcolor=header_bg, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+
+    // --- Data rows ---
+    for row = 0 to total_rows - 1
+        mult = array.get(mult_arr, row)
+        table.cell(tbl, 0, row + 1, str.tostring(mult, "#.##"), text_color=color.black, text_size=size.small, text_halign=text.align_center, text_valign=text.align_center)
+
+        for col = 0 to 3
+            idx = row * total_cols + col
+            exp_val = array.get(exp_arr, idx)
+            pf_val = array.get(pf_arr, idx)
+            bg = array.get(bgcolor_arr, idx)
+            bold = array.get(bold_arr, idx)
+
+            var string cell_text = ""
+            if not na(exp_val)
+                cell_text := f_format_exp(exp_val, pf_val, true)
+            else
+                cell_text := "-"
+
+            if bold
+                cell_text := "⭐ " + cell_text
+
+            table.cell(tbl, col + 1, row + 1, cell_text,
+                text_color = color.black,
+                bgcolor = bg,
+                text_size = size.small,
+                text_halign = text.align_center,
+                text_valign = text.align_center
+            )
+
+    // --- Verdict Row ---
+    var string verdict_text = ""
+    if peak_cell != -1
+        peak_row = peak_cell / total_cols
+        peak_col = peak_cell % total_cols
+        col_names = array.from("STD_OFF", "STD_HTF", "ER_OFF", "ER_HTF")
+        peak_col_name = array.get(col_names, peak_col)
+        peak_mult = array.get(mult_arr, peak_row)
+        peak_exp = array.get(exp_arr, peak_cell)
+        verdict_text := "🔥 Best: " + peak_col_name + " @ Mult=" + str.tostring(peak_mult, "#.##") + " (Exp=" + str.tostring(peak_exp, "#.##") + "%)"
+
+    if best_plat_idx != -1
+        col_names = array.from("STD_OFF", "STD_HTF", "ER_OFF", "ER_HTF")
+        best_col = array.get(plat_col, best_plat_idx)
+        best_col_name = array.get(col_names, best_col)
+        best_start = array.get(plat_start, best_plat_idx)
+        best_end = array.get(plat_end, best_plat_idx)
+        start_mult = array.get(mult_arr, best_start)
+        end_mult = array.get(mult_arr, best_end)
+        verdict_text := verdict_text + " | 📊 Plateau: " + best_col_name + " @ " + str.tostring(start_mult, "#.##") + "–" + str.tostring(end_mult, "#.##")
+        mid_mult = array.get(mult_arr, math.floor((best_start + best_end)/2))
+        verdict_text := verdict_text + " | ⭐ Recommend: " + best_col_name + " @ " + str.tostring(mid_mult, "#.##")
+
+    if verdict_text == ""
+        verdict_text := "No trades generated for any combination."
+
+    table.cell(tbl, 0, total_rows + 1, "Verdict:", text_color=color.black, bgcolor=color.new(color.yellow, 20), text_size=size.small, text_halign=text.align_left, text_valign=text.align_center)
+    table.cell(tbl, 1, total_rows + 1, verdict_text, text_color=color.black, bgcolor=na, text_size=size.small, text_halign=text.align_left, text_valign=text.align_center)
+
+// ═══════════════════════════════════════════════════════════════
+//  7. PLOTS
+// ═══════════════════════════════════════════════════════════════
+
+plot(i_show_table ? htf_ma : na, color=color.purple, linewidth=1, title="HTF MA")
+plot(i_show_table ? er : na, color=color.blue, linewidth=1, title="ER", display=display.status_line)
